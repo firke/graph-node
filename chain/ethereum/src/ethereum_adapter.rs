@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use ethabi::ParamType;
 use graph::prelude::{
-    anyhow, debug, error, ethabi,
+    anyhow, async_trait, debug, error, ethabi,
     futures03::{self, compat::Future01CompatExt, FutureExt, StreamExt, TryStreamExt},
     hex, retry, stream, tiny_keccak, trace, warn,
     web3::{
@@ -32,7 +32,9 @@ use web3::types::Filter;
 
 #[derive(Clone)]
 pub struct EthereumAdapter<T: web3::Transport> {
+    logger: Logger,
     url_hostname: Arc<String>,
+    provider: String,
     web3: Arc<Web3<T>>,
     metrics: Arc<ProviderEthRpcMetrics>,
     is_ganache: bool,
@@ -85,6 +87,8 @@ lazy_static! {
 impl<T: web3::Transport> CheapClone for EthereumAdapter<T> {
     fn cheap_clone(&self) -> Self {
         Self {
+            logger: self.logger.clone(),
+            provider: self.provider.clone(),
             url_hostname: self.url_hostname.cheap_clone(),
             web3: self.web3.cheap_clone(),
             metrics: self.metrics.cheap_clone(),
@@ -100,6 +104,8 @@ where
     T::Out: Send,
 {
     pub async fn new(
+        logger: Logger,
+        provider: String,
         url: &str,
         transport: T,
         provider_metrics: Arc<ProviderEthRpcMetrics>,
@@ -124,6 +130,8 @@ where
             .unwrap_or(false);
 
         EthereumAdapter {
+            logger,
+            provider,
             url_hostname: Arc::new(hostname),
             web3,
             metrics: provider_metrics,
@@ -615,6 +623,7 @@ where
     }
 }
 
+#[async_trait]
 impl<T> EthereumAdapterTrait for EthereumAdapter<T>
 where
     T: web3::BatchTransport + Send + Sync + 'static,
@@ -625,11 +634,12 @@ where
         &self.url_hostname
     }
 
-    fn net_identifiers(
-        &self,
-        logger: &Logger,
-    ) -> Box<dyn Future<Item = EthereumNetworkIdentifier, Error = Error> + Send> {
-        let logger = logger.clone();
+    fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    async fn net_identifiers(&self) -> Result<EthereumNetworkIdentifier, Error> {
+        let logger = self.logger.clone();
 
         let web3 = self.web3.clone();
         let net_version_future = retry("net_version RPC call", &logger)
@@ -656,21 +666,21 @@ where
                     })
             });
 
-        Box::new(
-            net_version_future
-                .join(gen_block_hash_future)
-                .map(
-                    |(net_version, genesis_block_hash)| EthereumNetworkIdentifier {
-                        net_version,
-                        genesis_block_hash,
-                    },
-                )
-                .map_err(|e| {
-                    e.into_inner().unwrap_or_else(|| {
-                        anyhow!("Ethereum node took too long to read network identifiers")
-                    })
-                }),
-        )
+        net_version_future
+            .join(gen_block_hash_future)
+            .compat()
+            .await
+            .map(
+                |(net_version, genesis_block_hash)| EthereumNetworkIdentifier {
+                    net_version,
+                    genesis_block_hash,
+                },
+            )
+            .map_err(|e| {
+                e.into_inner().unwrap_or_else(|| {
+                    anyhow!("Ethereum node took too long to read network identifiers")
+                })
+            })
     }
 
     fn latest_block_header(

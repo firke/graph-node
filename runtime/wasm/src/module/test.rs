@@ -1,4 +1,4 @@
-use ethabi::Token;
+use ethabi::{Contract, Token};
 use hex;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
@@ -105,7 +105,7 @@ fn mock_data_source(path: &str) -> DataSource {
         },
         mapping: Mapping {
             kind: String::from("ethereum/events"),
-            api_version: String::from("0.1.0"),
+            api_version: Version::parse("0.1.0").unwrap(),
             language: String::from("wasm/assemblyscript"),
             entities: vec![],
             abis: vec![],
@@ -117,8 +117,30 @@ fn mock_data_source(path: &str) -> DataSource {
             },
             runtime: Arc::new(runtime.clone()),
         },
-        context: None,
+        context: Default::default(),
         creation_block: None,
+        contract_abi: Arc::new(mock_abi()),
+    }
+}
+
+fn mock_abi() -> MappingABI {
+    MappingABI {
+        name: "mock_abi".to_string(),
+        contract: Contract::load(
+            r#"[
+            {
+                "inputs": [
+                    {
+                        "name": "a",
+                        "type": "address"
+                    }
+                ],
+                "type": "constructor"
+            }
+        ]"#
+            .as_bytes(),
+        )
+        .unwrap(),
     }
 }
 
@@ -141,7 +163,7 @@ fn mock_host_exports(
         },
         mapping: Mapping {
             kind: String::from("ethereum/events"),
-            api_version: String::from("0.1.0"),
+            api_version: Version::parse("0.1.0").unwrap(),
             language: String::from("wasm/assemblyscript"),
             entities: vec![],
             abis: vec![],
@@ -155,15 +177,12 @@ fn mock_host_exports(
         },
     }];
 
+    let network = data_source.network.clone().unwrap();
     HostExports::new(
         subgraph_id,
-        Version::parse(&data_source.mapping.api_version).unwrap(),
-        data_source.name,
-        data_source.source.address,
-        data_source.network.unwrap(),
-        data_source.context,
+        &data_source,
+        network,
         Arc::new(templates),
-        data_source.mapping.abis,
         mock_ethereum_adapter,
         Arc::new(graph_core::LinkResolver::from(
             ipfs_api::IpfsClient::default(),
@@ -200,14 +219,14 @@ fn mock_context(
 
 impl WasmInstance {
     fn invoke_export<C, R>(&self, f: &str, arg: AscPtr<C>) -> AscPtr<R> {
-        let func = self.get_func(f).get1().unwrap();
-        let ptr: u32 = func(arg.wasm_ptr()).unwrap();
+        let func = self.get_func(f).typed().unwrap().clone();
+        let ptr: u32 = func.call(arg.wasm_ptr()).unwrap();
         ptr.into()
     }
 
     fn invoke_export2<C, D, R>(&self, f: &str, arg0: AscPtr<C>, arg1: AscPtr<D>) -> AscPtr<R> {
-        let func = self.get_func(f).get2().unwrap();
-        let ptr: u32 = func(arg0.wasm_ptr(), arg1.wasm_ptr()).unwrap();
+        let func = self.get_func(f).typed().unwrap().clone();
+        let ptr: u32 = func.call((arg0.wasm_ptr(), arg1.wasm_ptr())).unwrap();
         ptr.into()
     }
 
@@ -217,18 +236,18 @@ impl WasmInstance {
         arg0: AscPtr<C>,
         arg1: AscPtr<D>,
     ) -> Result<(), wasmtime::Trap> {
-        let func = self.get_func(f).get2().unwrap();
-        func(arg0.wasm_ptr(), arg1.wasm_ptr())
+        let func = self.get_func(f).typed().unwrap().clone();
+        func.call((arg0.wasm_ptr(), arg1.wasm_ptr()))
     }
 
     fn takes_ptr_returns_val<P, V: wasmtime::WasmTy>(&mut self, fn_name: &str, v: AscPtr<P>) -> V {
-        let func = self.get_func(fn_name).get1().unwrap();
-        func(v.wasm_ptr()).unwrap()
+        let func = self.get_func(fn_name).typed().unwrap().clone();
+        func.call(v.wasm_ptr()).unwrap()
     }
 
     fn takes_val_returns_ptr<P>(&mut self, fn_name: &str, val: impl wasmtime::WasmTy) -> AscPtr<P> {
-        let func = self.get_func(fn_name).get1().unwrap();
-        let ptr: u32 = func(val).unwrap();
+        let func = self.get_func(fn_name).typed().unwrap().clone();
+        let ptr: u32 = func.call(val).unwrap();
         ptr.into()
     }
 }
@@ -364,8 +383,8 @@ async fn ipfs_map() {
                 let user_data = module.asc_new(USER_DATA).unwrap();
 
                 // Invoke the callback
-                let func = module.get_func("ipfsMap").get2().unwrap();
-                let _: () = func(value.wasm_ptr(), user_data.wasm_ptr())?;
+                let func = module.get_func("ipfsMap").typed().unwrap().clone();
+                let _: () = func.call((value.wasm_ptr(), user_data.wasm_ptr()))?;
                 let mut mods = module
                     .take_ctx()
                     .ctx
@@ -573,8 +592,7 @@ async fn big_int_arithmetic() {
 #[tokio::test]
 async fn abort() {
     let module = test_module("abort", mock_data_source("wasm_test/abort.wasm"));
-    let func = module.get_func("abort").get0().unwrap();
-    let res: Result<(), _> = func();
+    let res: Result<(), _> = module.get_func("abort").typed().unwrap().call(());
     assert!(res
         .unwrap_err()
         .to_string()
@@ -614,12 +632,10 @@ async fn data_source_create() {
     };
 
     // Test with a valid template
-    let data_source = String::from("example data source");
     let template = String::from("example template");
     let params = vec![String::from("0xc0a47dFe034B400B47bDaD5FecDa2621de6c4d95")];
     let result = run_data_source_create(template.clone(), params.clone())
         .expect("unexpected error returned from dataSourceCreate");
-    assert_eq!(result[0].data_source, data_source);
     assert_eq!(result[0].params, params.clone());
     assert_eq!(result[0].template.name, template);
 

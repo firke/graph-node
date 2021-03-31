@@ -19,7 +19,7 @@ use crate::prelude::*;
 
 pub type EventSignature = H256;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 /// A collection of attributes that (kind of) uniquely identify an Ethereum blockchain.
 pub struct EthereumNetworkIdentifier {
     pub net_version: String,
@@ -593,15 +593,16 @@ impl BlockStreamMetrics {
 /// Implementations may be implemented against an in-process Ethereum node
 /// or a remote node over RPC.
 #[automock]
+#[async_trait]
 pub trait EthereumAdapter: Send + Sync + 'static {
     fn url_hostname(&self) -> &str;
 
+    /// The `provider.label` from the adapter's configuration
+    fn provider(&self) -> &str;
+
     /// Ask the Ethereum node for some identifying information about the Ethereum network it is
     /// connected to.
-    fn net_identifiers(
-        &self,
-        logger: &Logger,
-    ) -> Box<dyn Future<Item = EthereumNetworkIdentifier, Error = Error> + Send>;
+    async fn net_identifiers(&self) -> Result<EthereumNetworkIdentifier, Error>;
 
     /// Get the latest block, including full transactions.
     fn latest_block(
@@ -761,7 +762,7 @@ fn parse_log_triggers(
                 .logs
                 .iter()
                 .filter(move |log| log_filter.matches(log))
-                .map(move |log| EthereumTrigger::Log(log.clone()))
+                .map(move |log| EthereumTrigger::Log(Arc::new(log.clone())))
         })
         .collect()
 }
@@ -774,7 +775,7 @@ fn parse_call_triggers(
         .calls
         .iter()
         .filter(move |call| call_filter.matches(call))
-        .map(move |call| EthereumTrigger::Call(call.clone()))
+        .map(move |call| EthereumTrigger::Call(Arc::new(call.clone())))
         .collect()
 }
 
@@ -886,7 +887,12 @@ pub async fn blocks_with_triggers(
     if !log_filter.is_empty() {
         trigger_futs.push(Box::new(
             eth.logs_in_block_range(&logger, subgraph_metrics.clone(), from, to, log_filter)
-                .map_ok(|logs: Vec<Log>| logs.into_iter().map(EthereumTrigger::Log).collect())
+                .map_ok(|logs: Vec<Log>| {
+                    logs.into_iter()
+                        .map(Arc::new)
+                        .map(EthereumTrigger::Log)
+                        .collect()
+                })
                 .compat(),
         ))
     }
@@ -894,6 +900,7 @@ pub async fn blocks_with_triggers(
     if !call_filter.is_empty() {
         trigger_futs.push(Box::new(
             eth.calls_in_block_range(&logger, subgraph_metrics.clone(), from, to, call_filter)
+                .map(Arc::new)
                 .map(EthereumTrigger::Call)
                 .collect(),
         ));

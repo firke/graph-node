@@ -74,14 +74,14 @@ pub(crate) struct HostExports {
     data_source_name: String,
     data_source_address: Option<Address>,
     data_source_network: String,
-    data_source_context: Option<DataSourceContext>,
+    data_source_context: Arc<Option<DataSourceContext>>,
     /// Some data sources have indeterminism or different notions of time. These
     /// need to be each be stored separately to separate causality between them,
     /// and merge the results later. Right now, this is just the ethereum
     /// networks but will be expanded for ipfs and the availability chain.
     causality_region: String,
     templates: Arc<Vec<DataSourceTemplate>>,
-    abis: Vec<MappingABI>,
+    abis: Vec<Arc<MappingABI>>,
     ethereum_adapter: Arc<dyn EthereumAdapter>,
     pub(crate) link_resolver: Arc<dyn LinkResolver>,
     call_cache: Arc<dyn EthereumCallCache>,
@@ -100,13 +100,9 @@ impl std::fmt::Debug for HostExports {
 impl HostExports {
     pub(crate) fn new(
         subgraph_id: SubgraphDeploymentId,
-        api_version: Version,
-        data_source_name: String,
-        data_source_address: Option<Address>,
+        data_source: &DataSource,
         data_source_network: String,
-        data_source_context: Option<DataSourceContext>,
         templates: Arc<Vec<DataSourceTemplate>>,
-        abis: Vec<MappingABI>,
         ethereum_adapter: Arc<dyn EthereumAdapter>,
         link_resolver: Arc<dyn LinkResolver>,
         store: Arc<dyn crate::RuntimeStore>,
@@ -118,14 +114,14 @@ impl HostExports {
 
         Self {
             subgraph_id,
-            api_version,
-            data_source_name,
-            data_source_address,
+            api_version: data_source.mapping.api_version.clone(),
+            data_source_name: data_source.name.clone(),
+            data_source_address: data_source.source.address.clone(),
             data_source_network,
-            data_source_context,
+            data_source_context: data_source.context.cheap_clone(),
             causality_region,
             templates,
-            abis,
+            abis: data_source.mapping.abis.clone(),
             ethereum_adapter,
             link_resolver,
             call_cache,
@@ -721,7 +717,6 @@ impl HostExports {
 
         // Remember that we need to create this data source
         state.push_created_data_source(DataSourceTemplateInfo {
-            data_source: self.data_source_name.clone(),
             template,
             params,
             context,
@@ -766,7 +761,10 @@ impl HostExports {
     }
 
     pub(crate) fn data_source_context(&self) -> Entity {
-        self.data_source_context.clone().unwrap_or_default()
+        self.data_source_context
+            .as_ref()
+            .clone()
+            .unwrap_or_default()
     }
 
     pub(crate) fn arweave_transaction_data(&self, tx_id: &str) -> Option<Bytes> {

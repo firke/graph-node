@@ -1,5 +1,4 @@
 use crate::module::{ExperimentalFeatures, WasmInstance};
-use ethabi::LogParam;
 use futures::sync::mpsc;
 use futures03::channel::oneshot::Sender;
 use graph::components::ethereum::*;
@@ -8,9 +7,6 @@ use graph::prelude::*;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
-use strum_macros::AsStaticStr;
-use web3::types::{Log, Transaction};
 
 lazy_static! {
     /// Verbose logging of mapping inputs
@@ -101,7 +97,7 @@ pub fn spawn_module(
                     section.end();
 
                     result_sender
-                        .send((result, future::ok(Instant::now())))
+                        .send(result)
                         .map_err(|_| anyhow::anyhow!("WASM module result receiver dropped."))
                 })
                 .wait()
@@ -118,36 +114,11 @@ pub fn spawn_module(
     Ok(mapping_request_sender)
 }
 
-#[derive(Debug, AsStaticStr)]
-pub(crate) enum MappingTrigger {
-    Log {
-        transaction: Arc<Transaction>,
-        log: Arc<Log>,
-        params: Vec<LogParam>,
-        handler: MappingEventHandler,
-    },
-    Call {
-        transaction: Arc<Transaction>,
-        call: Arc<EthereumCall>,
-        inputs: Vec<LogParam>,
-        outputs: Vec<LogParam>,
-        handler: MappingCallHandler,
-    },
-    Block {
-        handler: MappingBlockHandler,
-    },
-}
-
-type MappingResponse = (
-    Result<BlockState, MappingError>,
-    futures::Finished<Instant, Error>,
-);
-
 #[derive(Debug)]
 pub struct MappingRequest {
     pub(crate) ctx: MappingContext,
     pub(crate) trigger: MappingTrigger,
-    pub(crate) result_sender: Sender<MappingResponse>,
+    pub(crate) result_sender: Sender<Result<BlockState, MappingError>>,
 }
 
 #[derive(Debug)]
@@ -197,13 +168,15 @@ impl ValidModule {
         config.interruptable(true); // For timeouts.
         config.cranelift_nan_canonicalization(true); // For NaN determinism.
         config.cranelift_opt_level(wasmtime::OptLevel::None);
-        let engine = &wasmtime::Engine::new(&config);
+        let engine = &wasmtime::Engine::new(&config)?;
         let module = wasmtime::Module::from_binary(&engine, raw_module)?;
 
         let mut import_name_to_modules: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+        // Unwrap: Module linking is disabled.
         for (name, module) in module
             .imports()
-            .map(|import| (import.name(), import.module()))
+            .map(|import| (import.name().unwrap(), import.module()))
         {
             import_name_to_modules
                 .entry(name.to_string())

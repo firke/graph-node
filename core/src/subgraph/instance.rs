@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use futures01::sync::mpsc::Sender;
 use lazy_static::lazy_static;
 
@@ -7,8 +6,7 @@ use std::env;
 use std::str::FromStr;
 
 use graph::components::subgraph::{MappingError, SharedProofOfIndexing};
-use graph::prelude::{SubgraphInstance as SubgraphInstanceTrait, *};
-use web3::types::{Log, H256};
+use graph::prelude::*;
 
 lazy_static! {
     static ref MAX_DATA_SOURCES: Option<usize> = env::var("GRAPH_SUBGRAPH_MAX_DATA_SOURCES")
@@ -115,19 +113,8 @@ where
             host_metrics,
         )
     }
-}
 
-#[async_trait]
-impl<T> SubgraphInstanceTrait<T::Host> for SubgraphInstance<T>
-where
-    T: RuntimeHostBuilder,
-{
-    /// Returns true if the subgraph has a handler for an Ethereum event.
-    fn matches_log(&self, log: &Log) -> bool {
-        self.hosts.iter().any(|host| host.matches_log(log))
-    }
-
-    async fn process_trigger(
+    pub(crate) async fn process_trigger(
         &self,
         logger: &Logger,
         block: &Arc<LightEthereumBlock>,
@@ -146,7 +133,7 @@ where
         .await
     }
 
-    async fn process_trigger_in_runtime_hosts(
+    pub(crate) async fn process_trigger_in_runtime_hosts(
         logger: &Logger,
         hosts: &[Arc<T::Host>],
         block: &Arc<LightEthereumBlock>,
@@ -154,114 +141,30 @@ where
         mut state: BlockState,
         proof_of_indexing: SharedProofOfIndexing,
     ) -> Result<BlockState, MappingError> {
-        match trigger {
-            EthereumTrigger::Log(log) => {
-                let log = Arc::new(log);
+        for host in hosts {
+            let mapping_trigger = match host.match_and_decode(&trigger, &block, logger)? {
+                // Trigger matches and was decoded as a mapping trigger.
+                Some(mapping_trigger) => mapping_trigger,
 
-                let transaction = block
-                    .transaction_for_log(&log)
-                    .map(Arc::new)
-                    .context("Found no transaction for event")?;
-                let matching_hosts = hosts.iter().filter(|host| host.matches_log(&log));
-                let hosts_count = matching_hosts.clone().count();
+                // Trigger does not match, do not process it.
+                None => continue,
+            };
 
-                if hosts_count > 1 {
-                    info!(
-                        logger,
-                        "{} matching runtime hosts found for log trigger.", hosts_count;
-                        "address" => &log.address.to_string(),
-                        "topic0" => &log.topics.iter().next().unwrap_or(&H256::zero()).to_string(),
-                        "transaction" => log.transaction_hash.unwrap_or(H256::zero()).to_string(),
-                    );
-                }
-
-                // Process the log in each host in the same order the corresponding data
-                // sources appear in the subgraph manifest
-                let transaction = Arc::new(transaction);
-                for (i, host) in matching_hosts.enumerate() {
-                    let host_context = format!("{}/{}", i + 1, hosts_count);
-                    let logger = logger.new(o!("runtime_host" => host_context));
-                    state = host
-                        .process_log(
-                            &logger,
-                            block,
-                            &transaction,
-                            &log,
-                            state,
-                            proof_of_indexing.cheap_clone(),
-                        )
-                        .await?;
-                }
-            }
-            EthereumTrigger::Call(call) => {
-                let call = Arc::new(call);
-
-                let transaction = block
-                    .transaction_for_call(&call)
-                    .context("Found no transaction for call")?;
-                let transaction = Arc::new(transaction);
-                let matching_hosts = hosts.iter().filter(|host| host.matches_call(&call));
-                let hosts_count = matching_hosts.clone().count();
-
-                if hosts_count > 1 {
-                    info!(
-                        logger,
-                        "{} matching runtime hosts found for call trigger.", hosts_count;
-                        "from" => &call.from.to_string(),
-                        "to" => &call.to.to_string(),
-                        "transaction" => &call.transaction_hash.map(|hash| hash.to_string()).unwrap_or("unkown".to_string()),
-                    );
-                }
-
-                for (i, host) in matching_hosts.enumerate() {
-                    let host_context = format!("{}/{}", i + 1, hosts_count);
-                    let logger = logger.new(o!("runtime_host" => host_context));
-                    state = host
-                        .process_call(
-                            &logger,
-                            block,
-                            &transaction,
-                            &call,
-                            state,
-                            proof_of_indexing.cheap_clone(),
-                        )
-                        .await?;
-                }
-            }
-            EthereumTrigger::Block(ptr, trigger_type) => {
-                let matching_hosts = hosts
-                    .iter()
-                    .filter(|host| host.matches_block(&trigger_type, ptr.number));
-                let hosts_count = matching_hosts.clone().count();
-
-                if hosts_count > 1 {
-                    info!(
-                        logger,
-                        "{} matching runtime hosts found for block trigger.", hosts_count;
-                        "number" => &ptr.number,
-                        "hash" => &ptr.number,
-                    );
-                }
-
-                for (i, host) in matching_hosts.enumerate() {
-                    let host_context = format!("{}/{}", i + 1, hosts_count);
-                    let logger = logger.new(o!("runtime_host" => host_context));
-                    state = host
-                        .process_block(
-                            &logger,
-                            block,
-                            &trigger_type,
-                            state,
-                            proof_of_indexing.cheap_clone(),
-                        )
-                        .await?;
-                }
-            }
+            state = host
+                .process_mapping_trigger(
+                    logger,
+                    block,
+                    mapping_trigger,
+                    state,
+                    proof_of_indexing.cheap_clone(),
+                )
+                .await?;
         }
+
         Ok(state)
     }
 
-    fn add_dynamic_data_source(
+    pub(crate) fn add_dynamic_data_source(
         &mut self,
         logger: &Logger,
         data_source: DataSource,
@@ -295,7 +198,7 @@ where
         })
     }
 
-    fn revert_data_sources(&mut self, reverted_block: BlockNumber) {
+    pub(crate) fn revert_data_sources(&mut self, reverted_block: BlockNumber) {
         // `hosts` is ordered by the creation block.
         // See also 8f1bca33-d3b7-4035-affc-fd6161a12448.
         while self

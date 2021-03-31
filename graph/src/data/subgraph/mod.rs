@@ -1,4 +1,6 @@
-use anyhow::{anyhow, Context as _, Error};
+mod data_source;
+
+use anyhow::{anyhow, ensure, Error};
 use ethabi::Contract;
 use futures03::{
     future::{try_join, try_join3},
@@ -6,7 +8,7 @@ use futures03::{
     TryStreamExt as _,
 };
 use lazy_static::lazy_static;
-use semver::Version;
+use semver::{Version, VersionReq};
 use serde::de;
 use serde::ser;
 use serde_yaml;
@@ -19,7 +21,6 @@ use web3::types::{Address, H256};
 
 use crate::components::link_resolver::LinkResolver;
 use crate::components::store::{StoreError, SubgraphStore};
-use crate::components::subgraph::DataSourceTemplateInfo;
 use crate::data::graphql::TryFromValue;
 use crate::data::query::QueryExecutionError;
 use crate::data::schema::{Schema, SchemaImportError, SchemaValidationError};
@@ -30,11 +31,12 @@ use crate::prelude::{impl_slog_value, q, BlockNumber, Deserialize, Serialize};
 use crate::util::ethereum::string_to_h256;
 
 use crate::components::ethereum::NodeCapabilities;
-use std::convert::TryFrom;
 use std::fmt;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
+
+pub use self::data_source::DataSource;
 
 lazy_static! {
     static ref DISABLE_GRAFTS: bool = std::env::var("GRAPH_DISABLE_GRAFTS")
@@ -466,7 +468,6 @@ pub struct UnresolvedMappingABI {
 pub struct MappingABI {
     pub name: String,
     pub contract: Contract,
-    pub link: Link,
 }
 
 impl UnresolvedMappingABI {
@@ -487,7 +488,6 @@ impl UnresolvedMappingABI {
         Ok(MappingABI {
             name: self.name,
             contract,
-            link: self.file,
         })
     }
 }
@@ -546,10 +546,10 @@ pub struct UnresolvedMapping {
 #[derive(Clone, Debug)]
 pub struct Mapping {
     pub kind: String,
-    pub api_version: String,
+    pub api_version: Version,
     pub language: String,
     pub entities: Vec<String>,
-    pub abis: Vec<MappingABI>,
+    pub abis: Vec<Arc<MappingABI>>,
     pub block_handlers: Vec<MappingBlockHandler>,
     pub call_handlers: Vec<MappingCallHandler>,
     pub event_handlers: Vec<MappingEventHandler>,
@@ -599,6 +599,15 @@ impl Mapping {
             archive: self.calls_host_fn("ethereum.call"),
         }
     }
+
+    pub fn find_abi(&self, abi_name: &str) -> Result<Arc<MappingABI>, Error> {
+        Ok(self
+            .abis
+            .iter()
+            .find(|abi| abi.name == abi_name)
+            .ok_or_else(|| anyhow!("No ABI entry with name `{}` found", abi_name))?
+            .cheap_clone())
+    }
 }
 
 impl UnresolvedMapping {
@@ -619,12 +628,23 @@ impl UnresolvedMapping {
             file: link,
         } = self;
 
+        let api_version = Version::parse(&api_version)?;
+
+        ensure!(VersionReq::parse("<= 0.0.4").unwrap().matches(&api_version),
+            "The maximum supported mapping API version of this indexer is 0.0.4, but `{}` was found",
+            api_version
+        );
+
         info!(logger, "Resolve mapping"; "link" => &link.link);
 
         let (abis, runtime) = try_join(
             // resolve each abi
             abis.into_iter()
-                .map(|unresolved_abi| unresolved_abi.resolve(resolver, logger))
+                .map(|unresolved_abi| async {
+                    Result::<_, Error>::Ok(Arc::new(
+                        unresolved_abi.resolve(resolver, logger).await?,
+                    ))
+                })
                 .collect::<FuturesOrdered<_>>()
                 .try_collect::<Vec<_>>(),
             async {
@@ -650,19 +670,14 @@ impl UnresolvedMapping {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
-pub struct BaseDataSource<M> {
+struct UnresolvedDataSource {
     pub kind: String,
     pub network: Option<String>,
     pub name: String,
     pub source: Source,
-    pub mapping: M,
+    pub mapping: UnresolvedMapping,
     pub context: Option<DataSourceContext>,
-    #[serde(skip)]
-    pub creation_block: Option<BlockNumber>,
 }
-
-pub type UnresolvedDataSource = BaseDataSource<UnresolvedMapping>;
-pub type DataSource = BaseDataSource<Mapping>;
 
 impl UnresolvedDataSource {
     pub async fn resolve(
@@ -677,68 +692,13 @@ impl UnresolvedDataSource {
             source,
             mapping,
             context,
-            creation_block,
         } = self;
 
         info!(logger, "Resolve data source"; "name" => &name, "source" => &source.start_block);
 
         let mapping = mapping.resolve(&*resolver, logger).await?;
 
-        Ok(DataSource {
-            kind,
-            network,
-            name,
-            source,
-            mapping,
-            context,
-            creation_block,
-        })
-    }
-}
-
-impl TryFrom<DataSourceTemplateInfo> for DataSource {
-    type Error = anyhow::Error;
-
-    fn try_from(info: DataSourceTemplateInfo) -> Result<Self, anyhow::Error> {
-        let DataSourceTemplateInfo {
-            data_source: _,
-            template,
-            params,
-            context,
-            creation_block,
-        } = info;
-
-        // Obtain the address from the parameters
-        let string = params
-            .get(0)
-            .with_context(|| {
-                format!(
-                    "Failed to create data source from template `{}`: address parameter is missing",
-                    template.name
-                )
-            })?
-            .trim_start_matches("0x");
-
-        let address = Address::from_str(string).with_context(|| {
-            format!(
-                "Failed to create data source from template `{}`, invalid address provided",
-                template.name
-            )
-        })?;
-
-        Ok(DataSource {
-            kind: template.kind,
-            network: template.network,
-            name: template.name,
-            source: Source {
-                address: Some(address),
-                abi: template.source.abi,
-                start_block: 0,
-            },
-            mapping: template.mapping,
-            context,
-            creation_block: Some(creation_block),
-        })
+        DataSource::from_manifest(kind, network, name, source, mapping, context)
     }
 }
 
@@ -813,7 +773,7 @@ impl Graft {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BaseSubgraphManifest<S, D, T> {
     pub id: SubgraphDeploymentId,
@@ -915,9 +875,8 @@ impl UnvalidatedSubgraphManifest {
             .0
             .data_sources
             .iter()
-            .cloned()
             .filter(|d| d.kind.eq("ethereum/contract"))
-            .filter_map(|d| d.network)
+            .filter_map(|d| d.network.as_ref().map(|n| n.to_string()))
             .collect::<Vec<String>>();
         networks.sort();
         networks.dedup();
@@ -1012,9 +971,8 @@ impl SubgraphManifest {
         // Assume the manifest has been validated, ensuring network names are homogenous
         self.data_sources
             .iter()
-            .cloned()
             .filter(|d| &d.kind == "ethereum/contract")
-            .filter_map(|d| d.network)
+            .filter_map(|d| d.network.as_ref().map(|n| n.to_string()))
             .next()
             .expect("Validated manifest does not have a network defined on any datasource")
     }
